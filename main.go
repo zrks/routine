@@ -34,6 +34,61 @@ type Inventory struct {
 	Hosts []string `json:"hosts"`
 }
 
+func setupSSHClient(host string, config SSHConfig) (*ssh.Client, error) {
+	var authMethod ssh.AuthMethod
+	if config.KeyPath != "" {
+		key, err := os.ReadFile(config.KeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("read key: %v", err)
+		}
+		signer, err := ssh.ParsePrivateKey(key)
+		if err != nil {
+			return nil, fmt.Errorf("parse key: %v", err)
+		}
+		authMethod = ssh.PublicKeys(signer)
+	} else if config.Password != "" {
+		authMethod = ssh.Password(config.Password)
+	} else {
+		return nil, fmt.Errorf("no auth method")
+	}
+
+	clientConfig := &ssh.ClientConfig{
+		User:            config.User,
+		Auth:            []ssh.AuthMethod{authMethod},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         config.Timeout,
+	}
+
+	port := config.Port
+	if port == "" {
+		port = "22"
+	}
+	addr := fmt.Sprintf("%s:%s", host, port)
+
+	return ssh.Dial("tcp", addr, clientConfig)
+}
+
+func executeCommand(client *ssh.Client, cmd string) (string, error) {
+	session, err := client.NewSession()
+	if err != nil {
+		return "", fmt.Errorf("session: %v", err)
+	}
+	defer session.Close()
+
+	stdout, err := session.StdoutPipe()
+	if err != nil {
+		return "", fmt.Errorf("stdout pipe: %v", err)
+	}
+
+	if err := session.Start(cmd); err != nil {
+		return "", fmt.Errorf("start command: %v", err)
+	}
+
+	buf, _ := io.ReadAll(stdout)
+	session.Wait()
+	return string(buf), nil
+}
+
 // ExecuteRemoteCommands runs commands on multiple hosts
 func ExecuteRemoteCommands(config SSHConfig, commands []string) []CommandResult {
 	var wg sync.WaitGroup
@@ -46,43 +101,7 @@ func ExecuteRemoteCommands(config SSHConfig, commands []string) []CommandResult 
 
 			hostResult := CommandResult{Hostname: currentHost}
 
-			var authMethod ssh.AuthMethod
-			if config.KeyPath != "" {
-				key, err := os.ReadFile(config.KeyPath)
-				if err != nil {
-					hostResult.Error = fmt.Errorf("read key: %v", err)
-					results <- hostResult
-					return
-				}
-				signer, err := ssh.ParsePrivateKey(key)
-				if err != nil {
-					hostResult.Error = fmt.Errorf("parse key: %v", err)
-					results <- hostResult
-					return
-				}
-				authMethod = ssh.PublicKeys(signer)
-			} else if config.Password != "" {
-				authMethod = ssh.Password(config.Password)
-			} else {
-				hostResult.Error = fmt.Errorf("no auth method")
-				results <- hostResult
-				return
-			}
-
-			clientConfig := &ssh.ClientConfig{
-				User:            config.User,
-				Auth:            []ssh.AuthMethod{authMethod},
-				HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-				Timeout:         config.Timeout,
-			}
-
-			port := config.Port
-			if port == "" {
-				port = "22"
-			}
-			addr := fmt.Sprintf("%s:%s", currentHost, port)
-
-			client, err := ssh.Dial("tcp", addr, clientConfig)
+			client, err := setupSSHClient(currentHost, config)
 			if err != nil {
 				hostResult.Error = fmt.Errorf("dial %s: %v", currentHost, err)
 				results <- hostResult
@@ -92,32 +111,12 @@ func ExecuteRemoteCommands(config SSHConfig, commands []string) []CommandResult 
 
 			var combinedOutput string
 			for _, cmd := range commands {
-				session, err := client.NewSession()
-				if err != nil {
-					hostResult.Error = fmt.Errorf("session: %v", err)
-					results <- hostResult
-					return
-				}
-
-				stdout, err := session.StdoutPipe()
-				if err != nil {
-					hostResult.Error = fmt.Errorf("stdout pipe: %v", err)
-					session.Close()
-					results <- hostResult
-					return
-				}
-
-				err = session.Start(cmd)
+				output, err := executeCommand(client, cmd)
 				if err != nil {
 					combinedOutput += fmt.Sprintf("Command '%s' failed: %v\n", cmd, err)
-					session.Close()
 					continue
 				}
-
-				buf, _ := io.ReadAll(stdout)
-				session.Wait()
-				session.Close()
-				combinedOutput += fmt.Sprintf("Command '%s' output:\n%s\n", cmd, string(buf))
+				combinedOutput += fmt.Sprintf("Command '%s' output:\n%s\n", cmd, output)
 			}
 
 			hostResult.Output = combinedOutput
